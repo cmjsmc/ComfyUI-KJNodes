@@ -15,6 +15,8 @@ import comfy.model_management
 import comfy.utils
 import folder_paths
 from comfy_api.latest import io, ui
+from comfy.model_patcher import get_key_weight
+from comfy.quant_ops import QuantizedTensor
 
 device = comfy.model_management.get_torch_device()
 
@@ -184,6 +186,41 @@ class SafetensorsStreamWriter:
                 os.remove(self.temp_file.name)
             except OSError:
                 pass
+
+def _safe_quantized_key_patches(model_patcher, filter_prefix=None):
+    model = model_patcher.model
+    model_sd = model_patcher.model_state_dict()
+    p = {}
+
+    for k in model_sd:
+        if filter_prefix is not None and not k.startswith(filter_prefix):
+            continue
+
+        try:
+            weight, _, convert_func = get_key_weight(model, k)
+        except AttributeError:
+            continue
+
+        bk = model_patcher.backup.get(k, None)
+        if bk is not None:
+            weight = bk.weight
+
+        hbk = model_patcher.hook_backup.get(k, None)
+        if hbk is not None:
+            weight = hbk[0]
+
+        if isinstance(weight, QuantizedTensor):
+            weight = weight.dequantize()
+
+        if convert_func is None:
+            convert_func = lambda a, **kwargs: a
+
+        if k in model_patcher.patches:
+            p[k] = [(weight, convert_func)] + model_patcher.patches[k]
+        else:
+            p[k] = [(weight, convert_func)]
+
+    return p
 
 
 def _prefetch_worker(model_diff, keys, bias_diff, out_queue, error_holder):
