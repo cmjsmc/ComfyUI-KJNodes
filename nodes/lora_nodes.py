@@ -1,11 +1,19 @@
+
+import logging
+from tqdm import tqdm
+import os
+import gc
+import json
+import struct
+import shutil
+import tempfile
+import queue
+import threading
 import torch
+import numpy as np
 import comfy.model_management
 import comfy.utils
 import folder_paths
-import os
-import logging
-from tqdm import tqdm
-import numpy as np
 from comfy_api.latest import io, ui
 
 device = comfy.model_management.get_torch_device()
@@ -99,9 +107,121 @@ def extract_lora(diff, key, rank, algorithm, lora_type, lowrank_iters=7, adaptiv
         Vh = Vh.reshape(lora_rank, in_dim, kernel_size[0], kernel_size[1])
     return (U, Vh)
 
+_DTYPE_TO_SAFETENSORS = {
+    torch.float32: "F32",
+    torch.float16: "F16",
+    torch.bfloat16: "BF16",
+    torch.float8_e4m3fn: "F8_E4M3",
+    torch.float8_e5m2: "F8_E5M2",
+    torch.int64: "I64",
+    torch.int32: "I32",
+    torch.int16: "I16",
+    torch.int8: "I8",
+    torch.uint8: "U8",
+    torch.bool: "BOOL",
+}
 
-def calc_lora_model(model_diff, rank, prefix_model, prefix_lora, output_sd, lora_type, algorithm, lowrank_iters, out_dtype, bias_diff=False, adaptive_param=1.0, clamp_quantile=True):
-    # Get key names from module structure without materializing weights
+class SafetensorsStreamWriter:
+    def __init__(self, output_path: str, precomputed_header: dict = None):
+        self.output_path = output_path
+        self.precomputed_header = precomputed_header
+        self.offset = 0
+        self.header_entries = {}
+        
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+        if precomputed_header is not None:
+            self.mode = "direct"
+            self.file = open(output_path, "wb")
+            self._write_header(precomputed_header)
+        else:
+            self.mode = "staged"
+            self.temp_file = tempfile.NamedTemporaryFile(mode="wb", delete=False)
+
+    @staticmethod
+    def _encode_header(header_dict: dict) -> bytes:
+        json_bytes = json.dumps(header_dict, separators=(',', ':')).encode("utf-8")
+        padding = (8 - ((8 + len(json_bytes)) % 8)) % 8
+        return json_bytes + (b" " * padding)
+
+    def _write_header(self, header_dict: dict):
+        encoded = self._encode_header(header_dict)
+        self.file.write(struct.pack("<Q", len(encoded)))
+        self.file.write(encoded)
+
+    def write_tensor(self, name: str, tensor: torch.Tensor):
+        contiguous_tensor = tensor.contiguous().cpu()
+        raw_bytes = contiguous_tensor.view(torch.uint8).numpy().tobytes()
+        byte_length = len(raw_bytes)
+
+        if self.mode == "direct":
+            self.file.write(raw_bytes)
+        else:
+            self.header_entries[name] = {
+                "dtype": _DTYPE_TO_SAFETENSORS[tensor.dtype],
+                "shape": list(tensor.shape),
+                "data_offsets": [self.offset, self.offset + byte_length],
+            }
+            self.temp_file.write(raw_bytes)
+
+        self.offset += byte_length
+        del contiguous_tensor, raw_bytes, tensor
+
+    def close(self):
+        if self.mode == "direct":
+            self.file.flush()
+            self.file.close()
+        else:
+            self.temp_file.flush()
+            self.temp_file.close()
+
+            with open(self.output_path, "wb") as f_out:
+                self._write_header(self.header_entries)
+                with open(self.temp_file.name, "rb") as f_in:
+                    shutil.copyfileobj(f_in, f_out, length=64 * 1024 * 1024)
+
+            try:
+                os.remove(self.temp_file.name)
+            except OSError:
+                pass
+
+
+def _prefetch_worker(model_diff, keys, bias_diff, out_queue, error_holder):
+    try:
+        for k in keys:
+            if k.endswith(".weight"):
+                weight = model_diff.patch_weight_to_device(k, return_weight=True)
+                if weight is None or weight.ndim == 5:
+                    continue
+                out_queue.put((k, "weight", weight))
+            elif bias_diff and k.endswith(".bias"):
+                weight = model_diff.patch_weight_to_device(k, return_weight=True)
+                if weight is None:
+                    continue
+                out_queue.put((k, "bias", weight))
+    except Exception as e:
+        error_holder.append(e)
+    finally:
+        out_queue.put(None)
+
+
+def _writer_worker(writer, in_queue, error_holder):
+    try:
+        while True:
+            item = in_queue.get()
+            if item is None:
+                in_queue.task_done()
+                break
+
+            name, tensor = item
+            writer.write_tensor(name, tensor)
+            del tensor
+            in_queue.task_done()
+    except Exception as e:
+        error_holder.append(e)
+
+
+def calc_lora_model(model_diff, rank, prefix_model, prefix_lora, output_checkpoint, lora_type, algorithm, lowrank_iters, out_dtype, bias_diff=False, adaptive_param=1.0, clamp_quantile=True):
     sd_keys = []
     for name, _ in model_diff.model.named_parameters():
         if prefix_model is None or name.startswith(prefix_model):
@@ -111,56 +231,88 @@ def calc_lora_model(model_diff, rank, prefix_model, prefix_lora, output_sd, lora
             sd_keys.append(name)
 
     total_keys = len([k for k in sd_keys if k.endswith(".weight") or (bias_diff and k.endswith(".bias"))])
-    progress_bar = tqdm(total=total_keys, desc=f"Extracting LoRA ({prefix_lora.strip('.')})")
     comfy_pbar = comfy.utils.ProgressBar(total_keys)
 
-    # Process one weight at a time to minimize memory usage
-    for k in sd_keys:
-        if k.endswith(".weight"):
-            # Patch and retrieve single weight
-            weight_diff = model_diff.patch_weight_to_device(k, return_weight=True)
-            if weight_diff is None:
-                progress_bar.update(1)
-                comfy_pbar.update(1)
-                continue
-            if weight_diff.ndim == 5:
-                logging.info(f"Skipping 5D tensor for key {k}")
-                del weight_diff
-                progress_bar.update(1)
-                comfy_pbar.update(1)
-                continue
-            if lora_type != "full":
-                if weight_diff.ndim < 2:
-                    if bias_diff:
-                        output_sd["{}{}.diff".format(prefix_lora, k[len(prefix_model):-7])] = weight_diff.contiguous().to(out_dtype).cpu()
+    writer = SafetensorsStreamWriter(output_checkpoint)
+
+    prefetch_queue = queue.Queue(maxsize=1)
+    write_queue = queue.Queue(maxsize=1)
+    error_holder = []
+
+    prefetch_thread = threading.Thread(
+        target=_prefetch_worker,
+        args=(model_diff, sd_keys, bias_diff, prefetch_queue, error_holder),
+        daemon=True
+    )
+    writer_thread = threading.Thread(
+        target=_writer_worker,
+        args=(writer, write_queue, error_holder),
+        daemon=True
+    )
+
+    prefetch_thread.start()
+    writer_thread.start()
+
+    try:
+        while True:
+            if error_holder:
+                raise error_holder[0]
+
+            item = prefetch_queue.get()
+            if item is None:
+                break
+
+            k, kind, weight_diff = item
+            clean_name = k[len(prefix_model):-7 if kind == "weight" else -5]
+
+            if kind == "weight":
+                if lora_type != "full":
+                    if weight_diff.ndim >= 2:
+                        try:
+                            out = extract_lora(
+                                weight_diff.to(device), k, rank, algorithm, lora_type,
+                                lowrank_iters=lowrank_iters, adaptive_param=adaptive_param,
+                                clamp_quantile=clamp_quantile
+                            )
+                            del weight_diff
+
+                            up_tensor = out[0].contiguous().to(out_dtype)
+                            down_tensor = out[1].contiguous().to(out_dtype)
+                            del out
+
+                            write_queue.put((f"{prefix_lora}{clean_name}.lora_up.weight", up_tensor))
+                            write_queue.put((f"{prefix_lora}{clean_name}.lora_down.weight", down_tensor))
+                        except Exception:
+                            del weight_diff
+                    elif bias_diff:
+                        diff_tensor = weight_diff.contiguous().to(out_dtype)
+                        del weight_diff
+                        write_queue.put((f"{prefix_lora}{clean_name}.diff", diff_tensor))
+                else:
+                    diff_tensor = weight_diff.contiguous().to(out_dtype)
                     del weight_diff
-                    progress_bar.update(1)
-                    comfy_pbar.update(1)
-                    continue
-                try:
-                    out = extract_lora(weight_diff.to(device), k, rank, algorithm, lora_type, lowrank_iters=lowrank_iters, adaptive_param=adaptive_param, clamp_quantile=clamp_quantile)
-                    output_sd["{}{}.lora_up.weight".format(prefix_lora, k[len(prefix_model):-7])] = out[0].contiguous().to(out_dtype).cpu()
-                    output_sd["{}{}.lora_down.weight".format(prefix_lora, k[len(prefix_model):-7])] = out[1].contiguous().to(out_dtype).cpu()
-                except Exception as e:
-                    logging.warning(f"Could not generate lora weights for key {k}, error {e}")
-            else:
-                output_sd["{}{}.diff".format(prefix_lora, k[len(prefix_model):-7])] = weight_diff.contiguous().to(out_dtype).cpu()
-            del weight_diff
-            progress_bar.update(1)
+                    write_queue.put((f"{prefix_lora}{clean_name}.diff", diff_tensor))
+
+            elif kind == "bias" and bias_diff:
+                diff_b_tensor = weight_diff.contiguous().to(out_dtype)
+                del weight_diff
+                write_queue.put((f"{prefix_lora}{clean_name}.diff_b", diff_b_tensor))
+
             comfy_pbar.update(1)
 
-        elif bias_diff and k.endswith(".bias"):
-            weight = model_diff.patch_weight_to_device(k, return_weight=True)
-            if weight is not None:
-                output_sd["{}{}.diff_b".format(prefix_lora, k[len(prefix_model):-5])] = weight.contiguous().to(out_dtype).cpu()
-                del weight
-            progress_bar.update(1)
-            comfy_pbar.update(1)
+        write_queue.put(None)
+        writer_thread.join()
+        prefetch_thread.join()
 
-    progress_bar.close()
-    del model_diff
-    comfy.model_management.soft_empty_cache()
-    return output_sd
+        if error_holder:
+            raise error_holder[0]
+
+        writer.close()
+
+    finally:
+        del model_diff
+        gc.collect()
+        comfy.model_management.soft_empty_cache()
 
 
 class LoraExtractKJ(io.ComfyNode):
@@ -196,7 +348,12 @@ class LoraExtractKJ(io.ComfyNode):
         output_dir = folder_paths.get_output_directory()
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, output_dir)
 
-        output_sd = {}
+        if "adaptive" in lora_type:
+            rank_str = f"{lora_type}_{adaptive_param:.2f}"
+        else:
+            rank_str = rank
+        output_checkpoint = f"{filename}_rank_{rank_str}_{output_dtype}_{counter:05}_.safetensors"
+        output_checkpoint = os.path.join(full_output_folder, output_checkpoint)
 
         is_clip = hasattr(finetuned, "patcher")
 
@@ -205,21 +362,13 @@ class LoraExtractKJ(io.ComfyNode):
             kp = original.get_key_patches()
             kp = {k: v for k, v in kp.items() if not k.endswith(".position_ids") and not k.endswith(".logit_scale")}
             clip_diff.add_patches(kp, -1.0, 1.0)
-            output_sd = calc_lora_model(clip_diff.patcher, rank, "", "text_encoders.", output_sd, lora_type, algorithm, lowrank_iters, dtype, bias_diff=bias_diff, adaptive_param=adaptive_param, clamp_quantile=clamp_quantile)
+            calc_lora_model(clip_diff.patcher, rank, "", "text_encoders.", output_checkpoint, lora_type, algorithm, lowrank_iters, dtype, bias_diff=bias_diff, adaptive_param=adaptive_param, clamp_quantile=clamp_quantile)
         else:
             m = finetuned.clone()
             kp = original.get_key_patches("diffusion_model.")
             m.add_patches(kp, -1.0, 1.0)
-            output_sd = calc_lora_model(m, rank, "diffusion_model.", "diffusion_model.", output_sd, lora_type, algorithm, lowrank_iters, dtype, bias_diff=bias_diff, adaptive_param=adaptive_param, clamp_quantile=clamp_quantile)
+            calc_lora_model(m, rank, "diffusion_model.", "diffusion_model.", output_checkpoint, lora_type, algorithm, lowrank_iters, dtype, bias_diff=bias_diff, adaptive_param=adaptive_param, clamp_quantile=clamp_quantile)
 
-        if "adaptive" in lora_type:
-            rank_str = f"{lora_type}_{adaptive_param:.2f}"
-        else:
-            rank_str = rank
-        output_checkpoint = f"{filename}_rank_{rank_str}_{output_dtype}_{counter:05}_.safetensors"
-        output_checkpoint = os.path.join(full_output_folder, output_checkpoint)
-
-        comfy.utils.save_torch_file(output_sd, output_checkpoint, metadata=None)
         return io.NodeOutput(ui={"files": [ui.SavedResult(os.path.basename(output_checkpoint), subfolder, io.FolderType.output)]})
 
 class LoraReduceRank(io.ComfyNode):
