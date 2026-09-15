@@ -135,9 +135,10 @@ class SafetensorsStreamWriter:
         if precomputed_header is not None:
             self.mode = "direct"
             self.file = open(output_path, "wb")
-            self._write_header(precomputed_header)
+            self._write_header_to(self.file, precomputed_header)
         else:
             self.mode = "staged"
+            self.file = None
             self.temp_file = tempfile.NamedTemporaryFile(mode="wb", delete=False)
 
     @staticmethod
@@ -146,10 +147,11 @@ class SafetensorsStreamWriter:
         padding = (8 - ((8 + len(json_bytes)) % 8)) % 8
         return json_bytes + (b" " * padding)
 
-    def _write_header(self, header_dict: dict):
-        encoded = self._encode_header(header_dict)
-        self.file.write(struct.pack("<Q", len(encoded)))
-        self.file.write(encoded)
+    @classmethod
+    def _write_header_to(cls, file_obj, header_dict: dict):
+        encoded = cls._encode_header(header_dict)
+        file_obj.write(struct.pack("<Q", len(encoded)))
+        file_obj.write(encoded)
 
     def write_tensor(self, name: str, tensor: torch.Tensor):
         contiguous_tensor = tensor.contiguous().cpu()
@@ -171,14 +173,16 @@ class SafetensorsStreamWriter:
 
     def close(self):
         if self.mode == "direct":
-            self.file.flush()
-            self.file.close()
+            if self.file is not None:
+                self.file.flush()
+                self.file.close()
+                self.file = None
         else:
             self.temp_file.flush()
             self.temp_file.close()
 
             with open(self.output_path, "wb") as f_out:
-                self._write_header(self.header_entries)
+                self._write_header_to(f_out, self.header_entries)
                 with open(self.temp_file.name, "rb") as f_in:
                     shutil.copyfileobj(f_in, f_out, length=64 * 1024 * 1024)
 
