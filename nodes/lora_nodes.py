@@ -193,11 +193,16 @@ def _prefetch_worker(model_diff, keys, bias_diff, out_queue, error_holder):
                 weight = model_diff.patch_weight_to_device(k, return_weight=True)
                 if weight is None or weight.ndim == 5:
                     continue
+                # If the patched weight is a QuantizedTensor, dequantize on the fly
+                if isinstance(weight, QuantizedTensor):
+                    weight = weight.dequantize()
                 out_queue.put((k, "weight", weight))
             elif bias_diff and k.endswith(".bias"):
                 weight = model_diff.patch_weight_to_device(k, return_weight=True)
                 if weight is None:
                     continue
+                if isinstance(weight, QuantizedTensor):
+                    weight = weight.dequantize()
                 out_queue.put((k, "bias", weight))
     except Exception as e:
         error_holder.append(e)
@@ -359,15 +364,19 @@ class LoraExtractKJ(io.ComfyNode):
 
         if is_clip:
             clip_diff = finetuned.clone()
-            kp = original.get_key_patches()
+            kp = _safe_quantized_key_patches(original)
             kp = {k: v for k, v in kp.items() if not k.endswith(".position_ids") and not k.endswith(".logit_scale")}
             clip_diff.add_patches(kp, -1.0, 1.0)
-            calc_lora_model(clip_diff.patcher, rank, "", "text_encoders.", output_checkpoint, lora_type, algorithm, lowrank_iters, dtype, bias_diff=bias_diff, adaptive_param=adaptive_param, clamp_quantile=clamp_quantile)
+            calc_lora_model(clip_diff.patcher, rank, "", "text_encoders.", output_checkpoint,
+                            lora_type, algorithm, lowrank_iters, dtype, bias_diff=bias_diff,
+                            adaptive_param=adaptive_param, clamp_quantile=clamp_quantile)
         else:
             m = finetuned.clone()
-            kp = original.get_key_patches("diffusion_model.")
+            kp = _safe_quantized_key_patches(original, "diffusion_model.")
             m.add_patches(kp, -1.0, 1.0)
-            calc_lora_model(m, rank, "diffusion_model.", "diffusion_model.", output_checkpoint, lora_type, algorithm, lowrank_iters, dtype, bias_diff=bias_diff, adaptive_param=adaptive_param, clamp_quantile=clamp_quantile)
+            calc_lora_model(m, rank, "diffusion_model.", "diffusion_model.", output_checkpoint,
+                            lora_type, algorithm, lowrank_iters, dtype, bias_diff=bias_diff,
+                            adaptive_param=adaptive_param, clamp_quantile=clamp_quantile)
 
         return io.NodeOutput(ui={"files": [ui.SavedResult(os.path.basename(output_checkpoint), subfolder, io.FolderType.output)]})
 
