@@ -267,7 +267,64 @@ def _writer_worker(writer, in_queue, error_holder):
         error_holder.append(e)
 
 
-def calc_lora_model(model_diff, rank, prefix_model, prefix_lora, output_checkpoint, lora_type, algorithm, lowrank_iters, out_dtype, bias_diff=False, adaptive_param=1.0, clamp_quantile=True):
+def _compute_worker(in_queue, write_queue, rank, algorithm, lora_type, lowrank_iters,
+                    adaptive_param, clamp_quantile, out_dtype, prefix_lora, prefix_model,
+                    bias_diff, stream, error_holder):
+    try:
+        with torch.cuda.stream(stream):
+            while True:
+                item = in_queue.get()
+                if item is None:
+                    in_queue.task_done()
+                    break
+
+                k, kind, tensor = item
+                clean_name = k[len(prefix_model):-7 if kind == "weight" else -5]
+
+                if kind == "weight":
+                    if lora_type != "full":
+                        if tensor.ndim >= 2:
+                            try:
+                                out = extract_lora(
+                                    tensor.to(device, non_blocking=True), k, rank, algorithm, lora_type,
+                                    lowrank_iters=lowrank_iters, adaptive_param=adaptive_param,
+                                    clamp_quantile=clamp_quantile
+                                )
+                                del tensor
+
+                                up_tensor = out[0].contiguous().to(out_dtype)
+                                down_tensor = out[1].contiguous().to(out_dtype)
+                                del out
+
+                                # Ensure kernel completion before passing to writer
+                                stream.synchronize()
+                                write_queue.put((f"{prefix_lora}{clean_name}.lora_up.weight", up_tensor.cpu()))
+                                write_queue.put((f"{prefix_lora}{clean_name}.lora_down.weight", down_tensor.cpu()))
+                            except Exception:
+                                del tensor
+                        elif bias_diff:
+                            diff_tensor = tensor.contiguous().to(out_dtype).cpu()
+                            del tensor
+                            write_queue.put((f"{prefix_lora}{clean_name}.diff", diff_tensor))
+                    else:
+                        diff_tensor = tensor.contiguous().to(out_dtype).cpu()
+                        del tensor
+                        write_queue.put((f"{prefix_lora}{clean_name}.diff", diff_tensor))
+
+                elif kind == "bias" and bias_diff:
+                    diff_b_tensor = tensor.contiguous().to(out_dtype).cpu()
+                    del tensor
+                    write_queue.put((f"{prefix_lora}{clean_name}.diff_b", diff_b_tensor))
+
+                in_queue.task_done()
+    except Exception as e:
+        error_holder.append(e)
+
+
+def calc_lora_model(model_diff, rank, prefix_model, prefix_lora, output_checkpoint,
+                    lora_type, algorithm, lowrank_iters, out_dtype, bias_diff=False,
+                    adaptive_param=1.0, clamp_quantile=True):
+    
     sd_keys = []
     for name, _ in model_diff.model.named_parameters():
         if prefix_model is None or name.startswith(prefix_model):
@@ -279,76 +336,75 @@ def calc_lora_model(model_diff, rank, prefix_model, prefix_lora, output_checkpoi
     total_keys = len([k for k in sd_keys if k.endswith(".weight") or (bias_diff and k.endswith(".bias"))])
     comfy_pbar = comfy.utils.ProgressBar(total_keys)
 
+    # Concurrency budget: 3 parallel streams on 12GB cards (~3GB peak VRAM)
+    num_streams = 5 if torch.cuda.is_available() else 1
+
     writer = SafetensorsStreamWriter(output_checkpoint)
 
-    prefetch_queue = queue.Queue(maxsize=1)
-    write_queue = queue.Queue(maxsize=1)
+    task_queue = queue.Queue(maxsize=num_streams)
+    write_queue = queue.Queue(maxsize=num_streams * 2)
     error_holder = []
 
-    prefetch_thread = threading.Thread(
-        target=_prefetch_worker,
-        args=(model_diff, sd_keys, bias_diff, prefetch_queue, error_holder),
-        daemon=True
-    )
+    # Initialize GPU streams and workers
+    compute_threads = []
+    for _ in range(num_streams):
+        stream = torch.cuda.Stream(device=device) if torch.cuda.is_available() else None
+        t = threading.Thread(
+            target=_compute_worker,
+            args=(task_queue, write_queue, rank, algorithm, lora_type, lowrank_iters,
+                  adaptive_param, clamp_quantile, out_dtype, prefix_lora, prefix_model,
+                  bias_diff, stream, error_holder),
+            daemon=True
+        )
+        t.start()
+        compute_threads.append(t)
+
+    # Initialize disk writer worker
     writer_thread = threading.Thread(
         target=_writer_worker,
         args=(writer, write_queue, error_holder),
         daemon=True
     )
-
-    prefetch_thread.start()
     writer_thread.start()
 
     try:
-        while True:
+        # Main thread acts as sequential prefetcher
+        for k in sd_keys:
             if error_holder:
                 raise error_holder[0]
 
-            item = prefetch_queue.get()
-            if item is None:
-                break
+            if k.endswith(".weight"):
+                weight = model_diff.patch_weight_to_device(k, return_weight=True)
+                if weight is None or weight.ndim == 5:
+                    comfy_pbar.update(1)
+                    continue
+                if isinstance(weight, QuantizedTensor):
+                    weight = weight.dequantize()
 
-            k, kind, weight_diff = item
-            clean_name = k[len(prefix_model):-7 if kind == "weight" else -5]
+                task_queue.put((k, "weight", weight))
+                comfy_pbar.update(1)
 
-            if kind == "weight":
-                if lora_type != "full":
-                    if weight_diff.ndim >= 2:
-                        try:
-                            out = extract_lora(
-                                weight_diff.to(device), k, rank, algorithm, lora_type,
-                                lowrank_iters=lowrank_iters, adaptive_param=adaptive_param,
-                                clamp_quantile=clamp_quantile
-                            )
-                            del weight_diff
+            elif bias_diff and k.endswith(".bias"):
+                weight = model_diff.patch_weight_to_device(k, return_weight=True)
+                if weight is None:
+                    comfy_pbar.update(1)
+                    continue
+                if isinstance(weight, QuantizedTensor):
+                    weight = weight.dequantize()
 
-                            up_tensor = out[0].contiguous().to(out_dtype)
-                            down_tensor = out[1].contiguous().to(out_dtype)
-                            del out
+                task_queue.put((k, "bias", weight))
+                comfy_pbar.update(1)
 
-                            write_queue.put((f"{prefix_lora}{clean_name}.lora_up.weight", up_tensor))
-                            write_queue.put((f"{prefix_lora}{clean_name}.lora_down.weight", down_tensor))
-                        except Exception:
-                            del weight_diff
-                    elif bias_diff:
-                        diff_tensor = weight_diff.contiguous().to(out_dtype)
-                        del weight_diff
-                        write_queue.put((f"{prefix_lora}{clean_name}.diff", diff_tensor))
-                else:
-                    diff_tensor = weight_diff.contiguous().to(out_dtype)
-                    del weight_diff
-                    write_queue.put((f"{prefix_lora}{clean_name}.diff", diff_tensor))
+        # Signal completion to compute workers
+        for _ in range(num_streams):
+            task_queue.put(None)
 
-            elif kind == "bias" and bias_diff:
-                diff_b_tensor = weight_diff.contiguous().to(out_dtype)
-                del weight_diff
-                write_queue.put((f"{prefix_lora}{clean_name}.diff_b", diff_b_tensor))
+        for t in compute_threads:
+            t.join()
 
-            comfy_pbar.update(1)
-
+        # Signal completion to disk writer
         write_queue.put(None)
         writer_thread.join()
-        prefetch_thread.join()
 
         if error_holder:
             raise error_holder[0]
