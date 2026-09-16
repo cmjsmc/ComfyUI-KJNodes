@@ -374,23 +374,27 @@ def calc_lora_model(model_diff, rank, prefix_model, prefix_lora, output_checkpoi
                 raise error_holder[0]
 
             if k.endswith(".weight"):
-                weight = model_diff.patch_weight_to_device(k, return_weight=True)
+                # Pass device_to=device so ComfyUI computes the patch diff on CUDA
+                weight = model_diff.patch_weight_to_device(k, device_to=device, return_weight=True)
                 if weight is None or weight.ndim == 5:
                     comfy_pbar.update(1)
                     continue
+
+                # Ensure dequantization occurs on CUDA
                 if isinstance(weight, QuantizedTensor):
-                    weight = weight.dequantize()
+                    weight = weight.to(device).dequantize()
 
                 task_queue.put((k, "weight", weight))
                 comfy_pbar.update(1)
 
             elif bias_diff and k.endswith(".bias"):
-                weight = model_diff.patch_weight_to_device(k, return_weight=True)
+                weight = model_diff.patch_weight_to_device(k, device_to=device, return_weight=True)
                 if weight is None:
                     comfy_pbar.update(1)
                     continue
+
                 if isinstance(weight, QuantizedTensor):
-                    weight = weight.dequantize()
+                    weight = weight.to(device).dequantize()
 
                 task_queue.put((k, "bias", weight))
                 comfy_pbar.update(1)
