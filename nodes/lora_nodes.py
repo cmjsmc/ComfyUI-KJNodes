@@ -1,14 +1,24 @@
+
+import logging
+from tqdm import tqdm
+import os
+import gc
+import json
+import struct
+import shutil
+import tempfile
+import queue
+import threading
 import torch
+import numpy as np
 import comfy.model_management
 import comfy.utils
 import comfy.lora
 import comfy.model_patcher
 import folder_paths
-import os
-import logging
-from tqdm import tqdm
-import numpy as np
 from comfy_api.latest import io, ui
+from comfy.model_patcher import get_key_weight
+from comfy.quant_ops import QuantizedTensor
 
 device = comfy.model_management.get_torch_device()
 
@@ -206,7 +216,12 @@ class LoraExtractKJ(io.ComfyNode):
         output_dir = folder_paths.get_output_directory()
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, output_dir)
 
-        output_sd = {}
+        if "adaptive" in lora_type:
+            rank_str = f"{lora_type}_{adaptive_param:.2f}"
+        else:
+            rank_str = rank
+        output_checkpoint = f"{filename}_rank_{rank_str}_{output_dtype}_{counter:05}_.safetensors"
+        output_checkpoint = os.path.join(full_output_folder, output_checkpoint)
 
         is_clip = hasattr(finetuned, "patcher")
 
@@ -222,7 +237,6 @@ class LoraExtractKJ(io.ComfyNode):
         output_checkpoint = f"{filename}_rank_{rank_str}_{output_dtype}_{counter:05}_.safetensors"
         output_checkpoint = os.path.join(full_output_folder, output_checkpoint)
 
-        comfy.utils.save_torch_file(output_sd, output_checkpoint, metadata=None)
         return io.NodeOutput(ui={"files": [ui.SavedResult(os.path.basename(output_checkpoint), subfolder, io.FolderType.output)]})
 
 class LoraReduceRank(io.ComfyNode):
