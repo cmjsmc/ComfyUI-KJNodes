@@ -13,6 +13,8 @@ import torch
 import numpy as np
 import comfy.model_management
 import comfy.utils
+import comfy.lora
+import comfy.model_patcher
 import folder_paths
 from comfy_api.latest import io, ui
 from comfy.model_patcher import get_key_weight
@@ -21,75 +23,48 @@ from comfy.quant_ops import QuantizedTensor
 device = comfy.model_management.get_torch_device()
 
 CLAMP_QUANTILE = 0.99
+UNCHANGED_THRESHOLD = 1e-6  # skip tensors whose diff norm is below this fraction of the original weight norm
 
 def extract_lora(diff, key, rank, algorithm, lora_type, lowrank_iters=7, adaptive_param=1.0, clamp_quantile=True):
     """
     Extracts LoRA weights from a weight difference tensor using SVD.
+    Returns (lora_up, lora_down, fro_retained).
     """
-    conv2d = (len(diff.shape) == 4)
-    kernel_size = None if not conv2d else diff.size()[2:4]
-    conv2d_3x3 = conv2d and kernel_size != (1, 1)
-    out_dim, in_dim = diff.size()[0:2]
+    out_dim = diff.shape[0]
+    diff_2d = diff.flatten(start_dim=1).float()
+    # Exact total energy, so adaptive modes work with only the top singular values from svd_lowrank
+    total_energy = diff_2d.pow(2).sum()
 
-    if conv2d:
-        if conv2d_3x3:
-            diff = diff.flatten(start_dim=1)
-        else:
-            diff = diff.squeeze()
-
-    diff_float = diff.float()
     if algorithm == "svd_lowrank":
-        U, S, V = torch.svd_lowrank(diff_float, q=min(rank, in_dim, out_dim), niter=lowrank_iters)
-        U = U @ torch.diag(S)
+        U, S, V = torch.svd_lowrank(diff_2d, q=min(rank, *diff_2d.shape), niter=lowrank_iters)
         Vh = V.t()
     else:
-        #torch.linalg.svdvals() 
-        U, S, Vh = torch.linalg.svd(diff_float)
-        # Flexible rank selection logic like locon: https://github.com/KohakuBlueleaf/LyCORIS/blob/main/tools/extract_locon.py
-        if "adaptive" in lora_type:
-            if lora_type == "adaptive_ratio":
-                min_s = torch.max(S) * adaptive_param
-                lora_rank = torch.sum(S > min_s).item()
-            elif lora_type == "adaptive_energy":
-                energy = torch.cumsum(S**2, dim=0)
-                total_energy = torch.sum(S**2)
-                threshold = adaptive_param * total_energy  # e.g., adaptive_param=0.95 for 95%
-                lora_rank = torch.sum(energy < threshold).item() + 1
-            elif lora_type == "adaptive_quantile":
-                s_cum = torch.cumsum(S, dim=0)
-                min_cum_sum = adaptive_param * torch.sum(S)
-                lora_rank = torch.sum(s_cum < min_cum_sum).item()
-            elif lora_type == "adaptive_fro":
-                S_squared = S.pow(2)
-                S_fro_sq = float(torch.sum(S_squared))
-                sum_S_squared = torch.cumsum(S_squared, dim=0) / S_fro_sq
-                lora_rank = int(torch.searchsorted(sum_S_squared, adaptive_param**2)) + 1
-                lora_rank = max(1, min(lora_rank, len(S)))
-            else:
-                pass  # Will print after capping
-            
-            # Cap adaptive rank by the specified max rank
-            lora_rank = min(lora_rank, rank)
-            
-            # Calculate and print actual fro percentage retained after capping
-            if lora_type == "adaptive_fro":
-                S_squared = S.pow(2)
-                s_fro = torch.sqrt(torch.sum(S_squared))
-                s_red_fro = torch.sqrt(torch.sum(S_squared[:lora_rank]))
-                fro_percent = float(s_red_fro / s_fro)
-                logging.info(f"{key} Extracted LoRA rank: {lora_rank}, Frobenius retained: {fro_percent:.1%}")
-            else:
-                logging.info(f"{key} Extracted LoRA rank: {lora_rank}")
-        else:
-            lora_rank = rank
+        U, S, Vh = torch.linalg.svd(diff_2d, full_matrices=False)
 
-        lora_rank = max(1, lora_rank)
-        lora_rank = min(out_dim, in_dim, lora_rank)
-        
-        U = U[:, :lora_rank]
-        S = S[:lora_rank]
-        U = U @ torch.diag(S)
-        Vh = Vh[:lora_rank, :]
+    # Flexible rank selection logic like locon: https://github.com/KohakuBlueleaf/LyCORIS/blob/main/tools/extract_locon.py
+    if lora_type == "adaptive_ratio":
+        min_s = torch.max(S) * adaptive_param
+        lora_rank = torch.sum(S > min_s).item()
+    elif lora_type == "adaptive_energy":
+        energy = torch.cumsum(S**2, dim=0)
+        threshold = adaptive_param * total_energy  # e.g., adaptive_param=0.95 for 95%
+        lora_rank = torch.sum(energy < threshold).item() + 1
+    elif lora_type == "adaptive_quantile":
+        s_cum = torch.cumsum(S, dim=0)
+        min_cum_sum = adaptive_param * torch.sum(S)
+        lora_rank = torch.sum(s_cum < min_cum_sum).item()
+    elif lora_type == "adaptive_fro":
+        sum_S_squared = torch.cumsum(S.pow(2), dim=0) / total_energy
+        lora_rank = int(torch.searchsorted(sum_S_squared, adaptive_param**2)) + 1
+    else:
+        lora_rank = rank
+    # Cap adaptive rank by the specified max rank
+    lora_rank = max(1, min(lora_rank, rank, S.numel()))
+
+    fro_retained = float(torch.sqrt(S[:lora_rank].pow(2).sum() / total_energy)) if total_energy > 0 else 1.0
+
+    U = U[:, :lora_rank] * S[:lora_rank]
+    Vh = Vh[:lora_rank]
 
     if clamp_quantile:
         dist = torch.cat([U.flatten(), Vh.flatten()])
@@ -104,321 +79,108 @@ def extract_lora(diff, key, rank, algorithm, lora_type, lowrank_iters=7, adaptiv
 
         U = U.clamp(low_val, hi_val)
         Vh = Vh.clamp(low_val, hi_val)
-    if conv2d:
-        U = U.reshape(out_dim, lora_rank, 1, 1)
-        Vh = Vh.reshape(lora_rank, in_dim, kernel_size[0], kernel_size[1])
-    return (U, Vh)
+    U = U.reshape(out_dim, lora_rank, *[1] * (diff.ndim - 2))
+    Vh = Vh.reshape(lora_rank, *diff.shape[1:])
+    return (U, Vh, fro_retained)
 
-_DTYPE_TO_SAFETENSORS = {
-    torch.float32: "F32",
-    torch.float16: "F16",
-    torch.bfloat16: "BF16",
-    torch.float8_e4m3fn: "F8_E4M3",
-    torch.float8_e5m2: "F8_E5M2",
-    torch.int64: "I64",
-    torch.int32: "I32",
-    torch.int16: "I16",
-    torch.int8: "I8",
-    torch.uint8: "U8",
-    torch.bool: "BOOL",
-}
 
-class SafetensorsStreamWriter:
-    def __init__(self, output_path: str, precomputed_header: dict = None):
-        self.output_path = output_path
-        self.precomputed_header = precomputed_header
-        self.offset = 0
-        self.header_entries = {}
-        
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-
-        if precomputed_header is not None:
-            self.mode = "direct"
-            self.file = open(output_path, "wb")
-            self._write_header_to(self.file, precomputed_header)
-        else:
-            self.mode = "staged"
-            self.file = None
-            self.temp_file = tempfile.NamedTemporaryFile(mode="wb", delete=False)
-
-    @staticmethod
-    def _encode_header(header_dict: dict) -> bytes:
-        json_bytes = json.dumps(header_dict, separators=(',', ':')).encode("utf-8")
-        padding = (8 - ((8 + len(json_bytes)) % 8)) % 8
-        return json_bytes + (b" " * padding)
-
-    @classmethod
-    def _write_header_to(cls, file_obj, header_dict: dict):
-        encoded = cls._encode_header(header_dict)
-        file_obj.write(struct.pack("<Q", len(encoded)))
-        file_obj.write(encoded)
-
-    def write_tensor(self, name: str, tensor: torch.Tensor):
-        contiguous_tensor = tensor.contiguous().cpu()
-        raw_bytes = contiguous_tensor.view(torch.uint8).numpy().tobytes()
-        byte_length = len(raw_bytes)
-
-        if self.mode == "direct":
-            self.file.write(raw_bytes)
-        else:
-            self.header_entries[name] = {
-                "dtype": _DTYPE_TO_SAFETENSORS[tensor.dtype],
-                "shape": list(tensor.shape),
-                "data_offsets": [self.offset, self.offset + byte_length],
-            }
-            self.temp_file.write(raw_bytes)
-
-        self.offset += byte_length
-        del contiguous_tensor, raw_bytes, tensor
-
-    def close(self):
-        if self.mode == "direct":
-            if self.file is not None:
-                self.file.flush()
-                self.file.close()
-                self.file = None
-        else:
-            self.temp_file.flush()
-            self.temp_file.close()
-
-            with open(self.output_path, "wb") as f_out:
-                self._write_header_to(f_out, self.header_entries)
-                with open(self.temp_file.name, "rb") as f_in:
-                    shutil.copyfileobj(f_in, f_out, length=64 * 1024 * 1024)
-
-            try:
-                os.remove(self.temp_file.name)
-            except OSError:
-                pass
-
-def _safe_quantized_key_patches(model_patcher, filter_prefix=None):
-    model = model_patcher.model
-    model_sd = model_patcher.model_state_dict()
+def _get_key_patches(patcher, filter_prefix):
+    # Like ModelPatcher.get_key_patches(), but walks parameters instead of state_dict keys: quantized layers
+    # serialize extras (weight_scale, comfy_quant) that aren't module attributes and break get_key_weight
     p = {}
-
-    for k in model_sd:
-        if filter_prefix is not None and not k.startswith(filter_prefix):
-            continue
-
-        try:
-            weight, _, convert_func = get_key_weight(model, k)
-        except AttributeError:
-            continue
-
-        bk = model_patcher.backup.get(k, None)
-        if bk is not None:
-            weight = bk.weight
-
-        hbk = model_patcher.hook_backup.get(k, None)
-        if hbk is not None:
-            weight = hbk[0]
-
-        if isinstance(weight, QuantizedTensor):
-            weight = weight.dequantize()
-
-        if convert_func is None:
-            convert_func = lambda a, **kwargs: a
-
-        if k in model_patcher.patches:
-            p[k] = [(weight, convert_func)] + model_patcher.patches[k]
-        else:
-            p[k] = [(weight, convert_func)]
-
+    with patcher.use_ejected():
+        for k, _ in patcher.model.named_parameters():
+            if not k.startswith(filter_prefix) or not k.endswith((".weight", ".bias")):
+                continue
+            weight, _, convert_func = comfy.model_patcher.get_key_weight(patcher.model, k)
+            if not isinstance(weight, torch.Tensor):
+                continue
+            bk = patcher.backup.get(k, None)
+            if bk is not None:
+                weight = bk.weight
+            hbk = patcher.hook_backup.get(k, None)
+            if hbk is not None:
+                weight = hbk[0]
+            if convert_func is None:
+                convert_func = lambda a, **kwargs: a
+            p[k] = [(weight, convert_func)] + patcher.patches.get(k, [])
     return p
 
 
-def _prefetch_worker(model_diff, keys, bias_diff, out_queue, error_holder):
-    try:
-        for k in keys:
-            if k.endswith(".weight"):
-                weight = model_diff.patch_weight_to_device(k, return_weight=True)
-                if weight is None or weight.ndim == 5:
+def _materialize_weight(patch_list, key):
+    # Rebuild a weight from get_key_patches() output in fp32 on the compute device, applying any patches (loras etc.)
+    weight, convert_func = patch_list[0]
+    weight = convert_func(comfy.model_management.cast_to_device(weight, device, torch.float32, copy=True), inplace=True)
+    if len(patch_list) > 1:
+        weight = comfy.lora.calculate_weight(patch_list[1:], weight, key)
+    return weight
+
+
+def calc_lora_model(finetuned_patches, original_patches, rank, prefix_model, prefix_lora, output_sd, lora_type, algorithm, lowrank_iters, out_dtype, bias_diff=False, adaptive_param=1.0, clamp_quantile=True):
+    keys = [k for k in finetuned_patches if k.endswith(".weight") or (bias_diff and k.endswith(".bias"))]
+    progress_bar = tqdm(total=len(keys), desc=f"Extracting LoRA ({prefix_lora.strip('.')})")
+    comfy_pbar = comfy.utils.ProgressBar(len(keys))
+    stats = []  # (key, rank, fro_retained)
+    unchanged = 0
+    mismatched = []
+
+    # Process one weight at a time to minimize memory usage
+    for k in keys:
+        try:
+            lora_key = prefix_lora + k[len(prefix_model):].rsplit(".", 1)[0]
+            if k not in original_patches:
+                mismatched.append(k)
+                continue
+            # Diff in fp32 directly, the model patcher path would round it back to the storage dtype (or requantize it)
+            diff = _materialize_weight(finetuned_patches[k], k)
+            original = _materialize_weight(original_patches[k], k)
+            if diff.shape != original.shape:
+                mismatched.append(k)
+                continue
+            original_norm = torch.linalg.vector_norm(original)
+            diff.sub_(original)
+            del original
+            diff_norm = torch.linalg.vector_norm(diff)
+            if diff_norm <= UNCHANGED_THRESHOLD * original_norm:
+                unchanged += 1
+                continue
+
+            if k.endswith(".bias"):
+                output_sd[f"{lora_key}.diff_b"] = diff.to(out_dtype).cpu()
+            elif diff.ndim == 5:
+                logging.info(f"Skipping 5D tensor for key {k}")
+            elif lora_type == "full":
+                output_sd[f"{lora_key}.diff"] = diff.to(out_dtype).cpu()
+            elif diff.ndim < 2:
+                if bias_diff:
+                    output_sd[f"{lora_key}.diff"] = diff.to(out_dtype).cpu()
+            else:
+                try:
+                    up, down, fro_retained = extract_lora(diff, k, rank, algorithm, lora_type, lowrank_iters=lowrank_iters, adaptive_param=adaptive_param, clamp_quantile=clamp_quantile)
+                except Exception as e:
+                    logging.warning(f"Could not generate lora weights for key {k}, error {e}")
                     continue
-                # If the patched weight is a QuantizedTensor, dequantize on the fly
-                if isinstance(weight, QuantizedTensor):
-                    weight = weight.dequantize()
-                out_queue.put((k, "weight", weight))
-            elif bias_diff and k.endswith(".bias"):
-                weight = model_diff.patch_weight_to_device(k, return_weight=True)
-                if weight is None:
-                    continue
-                if isinstance(weight, QuantizedTensor):
-                    weight = weight.dequantize()
-                out_queue.put((k, "bias", weight))
-    except Exception as e:
-        error_holder.append(e)
-    finally:
-        out_queue.put(None)
+                output_sd[f"{lora_key}.lora_up.weight"] = up.contiguous().to(out_dtype).cpu()
+                output_sd[f"{lora_key}.lora_down.weight"] = down.contiguous().to(out_dtype).cpu()
+                stats.append((k, up.shape[1], fro_retained))
+                logging.info(f"{k}: rank {up.shape[1]}, fro retained {fro_retained:.1%}, weight change {float(diff_norm / original_norm.clamp_min(1e-12)):.2%}")
+        finally:
+            progress_bar.update(1)
+            comfy_pbar.update(1)
 
-
-def _writer_worker(writer, in_queue, error_holder):
-    try:
-        while True:
-            item = in_queue.get()
-            if item is None:
-                in_queue.task_done()
-                break
-
-            name, tensor = item
-            writer.write_tensor(name, tensor)
-            del tensor
-            in_queue.task_done()
-    except Exception as e:
-        error_holder.append(e)
-
-
-def _compute_worker(in_queue, write_queue, rank, algorithm, lora_type, lowrank_iters,
-                    adaptive_param, clamp_quantile, out_dtype, prefix_lora, prefix_model,
-                    bias_diff, stream, error_holder):
-    try:
-        with torch.cuda.stream(stream):
-            while True:
-                item = in_queue.get()
-                if item is None:
-                    in_queue.task_done()
-                    break
-
-                k, kind, tensor = item
-                clean_name = k[len(prefix_model):-7 if kind == "weight" else -5]
-
-                if kind == "weight":
-                    if lora_type != "full":
-                        if tensor.ndim >= 2:
-                            try:
-                                out = extract_lora(
-                                    tensor.to(device, non_blocking=True), k, rank, algorithm, lora_type,
-                                    lowrank_iters=lowrank_iters, adaptive_param=adaptive_param,
-                                    clamp_quantile=clamp_quantile
-                                )
-                                del tensor
-
-                                up_tensor = out[0].contiguous().to(out_dtype)
-                                down_tensor = out[1].contiguous().to(out_dtype)
-                                del out
-
-                                # Ensure kernel completion before passing to writer
-                                stream.synchronize()
-                                write_queue.put((f"{prefix_lora}{clean_name}.lora_up.weight", up_tensor.cpu()))
-                                write_queue.put((f"{prefix_lora}{clean_name}.lora_down.weight", down_tensor.cpu()))
-                            except Exception:
-                                del tensor
-                        elif bias_diff:
-                            diff_tensor = tensor.contiguous().to(out_dtype).cpu()
-                            del tensor
-                            write_queue.put((f"{prefix_lora}{clean_name}.diff", diff_tensor))
-                    else:
-                        diff_tensor = tensor.contiguous().to(out_dtype).cpu()
-                        del tensor
-                        write_queue.put((f"{prefix_lora}{clean_name}.diff", diff_tensor))
-
-                elif kind == "bias" and bias_diff:
-                    diff_b_tensor = tensor.contiguous().to(out_dtype).cpu()
-                    del tensor
-                    write_queue.put((f"{prefix_lora}{clean_name}.diff_b", diff_b_tensor))
-
-                in_queue.task_done()
-    except Exception as e:
-        error_holder.append(e)
-
-
-def calc_lora_model(model_diff, rank, prefix_model, prefix_lora, output_checkpoint,
-                    lora_type, algorithm, lowrank_iters, out_dtype, bias_diff=False,
-                    adaptive_param=1.0, clamp_quantile=True):
-    
-    sd_keys = []
-    for name, _ in model_diff.model.named_parameters():
-        if prefix_model is None or name.startswith(prefix_model):
-            sd_keys.append(name)
-    for name, _ in model_diff.model.named_buffers():
-        if prefix_model is None or name.startswith(prefix_model):
-            sd_keys.append(name)
-
-    total_keys = len([k for k in sd_keys if k.endswith(".weight") or (bias_diff and k.endswith(".bias"))])
-    comfy_pbar = comfy.utils.ProgressBar(total_keys)
-
-    # Concurrency budget: 3 parallel streams on 12GB cards (~3GB peak VRAM)
-    num_streams = 5 if torch.cuda.is_available() else 1
-
-    writer = SafetensorsStreamWriter(output_checkpoint)
-
-    task_queue = queue.Queue(maxsize=num_streams)
-    write_queue = queue.Queue(maxsize=num_streams * 2)
-    error_holder = []
-
-    # Initialize GPU streams and workers
-    compute_threads = []
-    for _ in range(num_streams):
-        stream = torch.cuda.Stream(device=device) if torch.cuda.is_available() else None
-        t = threading.Thread(
-            target=_compute_worker,
-            args=(task_queue, write_queue, rank, algorithm, lora_type, lowrank_iters,
-                  adaptive_param, clamp_quantile, out_dtype, prefix_lora, prefix_model,
-                  bias_diff, stream, error_holder),
-            daemon=True
-        )
-        t.start()
-        compute_threads.append(t)
-
-    # Initialize disk writer worker
-    writer_thread = threading.Thread(
-        target=_writer_worker,
-        args=(writer, write_queue, error_holder),
-        daemon=True
-    )
-    writer_thread.start()
-
-    try:
-        # Main thread acts as sequential prefetcher
-        for k in sd_keys:
-            if error_holder:
-                raise error_holder[0]
-
-            if k.endswith(".weight"):
-                # Pass device_to=device so ComfyUI computes the patch diff on CUDA
-                weight = model_diff.patch_weight_to_device(k, device_to=device, return_weight=True)
-                if weight is None or weight.ndim == 5:
-                    comfy_pbar.update(1)
-                    continue
-
-                # Ensure dequantization occurs on CUDA
-                if isinstance(weight, QuantizedTensor):
-                    weight = weight.to(device).dequantize()
-
-                task_queue.put((k, "weight", weight))
-                comfy_pbar.update(1)
-
-            elif bias_diff and k.endswith(".bias"):
-                weight = model_diff.patch_weight_to_device(k, device_to=device, return_weight=True)
-                if weight is None:
-                    comfy_pbar.update(1)
-                    continue
-
-                if isinstance(weight, QuantizedTensor):
-                    weight = weight.to(device).dequantize()
-
-                task_queue.put((k, "bias", weight))
-                comfy_pbar.update(1)
-
-        # Signal completion to compute workers
-        for _ in range(num_streams):
-            task_queue.put(None)
-
-        for t in compute_threads:
-            t.join()
-
-        # Signal completion to disk writer
-        write_queue.put(None)
-        writer_thread.join()
-
-        if error_holder:
-            raise error_holder[0]
-
-        writer.close()
-
-    finally:
-        del model_diff
-        gc.collect()
-        comfy.model_management.soft_empty_cache()
+    progress_bar.close()
+    name = prefix_lora.strip(".")
+    if unchanged:
+        logging.info(f"LoRA extraction ({name}): skipped {unchanged} unchanged tensors")
+    if mismatched:
+        logging.warning(f"LoRA extraction ({name}): skipped {len(mismatched)} tensors missing from the original model or with mismatched shapes: {', '.join(mismatched[:10])}{', ...' if len(mismatched) > 10 else ''}")
+    if stats:
+        fros = [s[2] for s in stats]
+        logging.info(f"LoRA extraction ({name}): {len(stats)} layers, mean rank {np.mean([s[1] for s in stats]):.1f}, fro retained mean {np.mean(fros):.1%}, min {min(fros):.1%}")
+        worst = sorted(stats, key=lambda s: s[2])[:5]
+        logging.info(f"Lowest fro retained: {', '.join(f'{k} {f:.1%} (rank {r})' for k, r, f in worst)}")
+    comfy.model_management.soft_empty_cache()
+    return output_sd
 
 
 class LoraExtractKJ(io.ComfyNode):
@@ -446,8 +208,8 @@ class LoraExtractKJ(io.ComfyNode):
 
     @classmethod
     def execute(cls, finetuned, original, filename_prefix, rank, lora_type, algorithm, lowrank_iters, output_dtype, bias_diff, adaptive_param, clamp_quantile) -> io.NodeOutput:
-        if algorithm == "svd_lowrank" and lora_type != "standard":
-            raise ValueError("svd_lowrank algorithm is only supported for standard LoRA extraction.")
+        if algorithm == "svd_lowrank" and lora_type == "adaptive_quantile":
+            raise ValueError("adaptive_quantile needs all singular values, use the svd_linalg algorithm.")
 
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[output_dtype]
 
@@ -464,20 +226,16 @@ class LoraExtractKJ(io.ComfyNode):
         is_clip = hasattr(finetuned, "patcher")
 
         if is_clip:
-            clip_diff = finetuned.clone()
-            kp = _safe_quantized_key_patches(original)
-            kp = {k: v for k, v in kp.items() if not k.endswith(".position_ids") and not k.endswith(".logit_scale")}
-            clip_diff.add_patches(kp, -1.0, 1.0)
-            calc_lora_model(clip_diff.patcher, rank, "", "text_encoders.", output_checkpoint,
-                            lora_type, algorithm, lowrank_iters, dtype, bias_diff=bias_diff,
-                            adaptive_param=adaptive_param, clamp_quantile=clamp_quantile)
+            output_sd = calc_lora_model(_get_key_patches(finetuned.patcher, ""), _get_key_patches(original.patcher, ""), rank, "", "text_encoders.", output_sd, lora_type, algorithm, lowrank_iters, dtype, bias_diff=bias_diff, adaptive_param=adaptive_param, clamp_quantile=clamp_quantile)
         else:
-            m = finetuned.clone()
-            kp = _safe_quantized_key_patches(original, "diffusion_model.")
-            m.add_patches(kp, -1.0, 1.0)
-            calc_lora_model(m, rank, "diffusion_model.", "diffusion_model.", output_checkpoint,
-                            lora_type, algorithm, lowrank_iters, dtype, bias_diff=bias_diff,
-                            adaptive_param=adaptive_param, clamp_quantile=clamp_quantile)
+            output_sd = calc_lora_model(_get_key_patches(finetuned, "diffusion_model."), _get_key_patches(original, "diffusion_model."), rank, "diffusion_model.", "diffusion_model.", output_sd, lora_type, algorithm, lowrank_iters, dtype, bias_diff=bias_diff, adaptive_param=adaptive_param, clamp_quantile=clamp_quantile)
+
+        if "adaptive" in lora_type:
+            rank_str = f"{lora_type}_{adaptive_param:.2f}"
+        else:
+            rank_str = rank
+        output_checkpoint = f"{filename}_rank_{rank_str}_{output_dtype}_{counter:05}_.safetensors"
+        output_checkpoint = os.path.join(full_output_folder, output_checkpoint)
 
         return io.NodeOutput(ui={"files": [ui.SavedResult(os.path.basename(output_checkpoint), subfolder, io.FolderType.output)]})
 
